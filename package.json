@@ -1,0 +1,32 @@
+{
+  "name": "gmail-spam-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Hosted MCP server for searching, reading and rescuing Gmail spam, on AWS Lambda behind WorkOS AuthKit",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "dev": "node src/local.ts",
+    "connect-google": "node scripts/connect-google.ts",
+    "deploy": "bash scripts/deploy.sh"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "htmlparser2": "^12.0.0",
+    "jose": "^6.2.14",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@aws-sdk/client-ssm": "^3.1161.0",
+    "@types/aws-lambda": "^8.10.164",
+    "@types/node": "^26.6.6",
+    "esbuild": "^0.28.2",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.5"
+  }
+}
