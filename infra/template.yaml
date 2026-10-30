@@ -1,0 +1,204 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Hosted MCP server for the Gmail spam folder (Lambda behind CloudFront, WorkOS AuthKit)
+
+Parameters:
+  AuthKitDomain:
+    Type: String
+    Description: WorkOS AuthKit domain, such as https://example-123.authkit.app
+  AllowedSubjects:
+    Type: String
+    Default: ""
+    Description: Comma-separated WorkOS user ids allowed to use the server. Empty locks everyone out.
+  AllowedGoogleEmail:
+    Type: String
+    Description: The only Google account the server will act on
+    AllowedPattern: ".+@.+"
+  ExtraAudiences:
+    Type: String
+    Default: ""
+    Description: Optional extra accepted token audiences, comma-separated
+  ParameterPrefix:
+    Type: String
+    Default: /gmail-spam-mcp
+    Description: SSM Parameter Store prefix holding the Google grant
+  ReservedConcurrency:
+    Type: Number
+    # Claude sends up to about ten tool calls at once, so leave it headroom.
+    Default: 25
+    MinValue: 0
+    Description: >-
+      Most copies of the function that may run at once. 0 leaves it uncapped,
+      which a new AWS account with a concurrency quota of 10 has to use.
+
+Conditions:
+  HasConcurrencyCap: !Not [!Equals [!Ref ReservedConcurrency, 0]]
+
+Resources:
+  FunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: gmail-spam-mcp
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub ${LogGroup.Arn}:*
+              # Put is only used if Google rotates the refresh token.
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:PutParameter
+                Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ParameterPrefix}/google-grant
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}
+      RetentionInDays: 14
+
+  Function:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref AWS::StackName
+      Runtime: nodejs22.x
+      Architectures: [arm64]
+      Handler: index.handler
+      MemorySize: 256
+      # Just under CloudFront's 30 second wait for the origin.
+      Timeout: 29
+      Role: !GetAtt FunctionRole.Arn
+      # Caps what a flood of requests to the public URL can cost.
+      ReservedConcurrentExecutions: !If [HasConcurrencyCap, !Ref ReservedConcurrency, !Ref AWS::NoValue]
+      LoggingConfig:
+        LogGroup: !Ref LogGroup
+      Environment:
+        Variables:
+          ORIGIN_SECRET: !Select [2, !Split ["/", !Ref AWS::StackId]]
+          AUTHKIT_DOMAIN: !Ref AuthKitDomain
+          ALLOWED_SUBJECTS: !Ref AllowedSubjects
+          ALLOWED_GOOGLE_EMAIL: !Ref AllowedGoogleEmail
+          EXTRA_AUDIENCES: !Ref ExtraAudiences
+          PARAMETER_PREFIX: !Ref ParameterPrefix
+      # Placeholder only: scripts/deploy.sh uploads the real bundle afterwards,
+      # which avoids needing an S3 bucket for the code.
+      Code:
+        ZipFile: |
+          exports.handler = async () => ({ statusCode: 503, body: "Not deployed yet: run scripts/deploy.sh" });
+
+  FunctionUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !GetAtt Function.Arn
+      # CloudFront cannot sign POST bodies for an IAM-protected function URL,
+      # so the URL is open and the handler requires CloudFront's secret header
+      # and then authenticates every MCP request.
+      AuthType: NONE
+
+  # Public function URLs need both of these permissions.
+  UrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref Function
+      Action: lambda:InvokeFunctionUrl
+      Principal: "*"
+      FunctionUrlAuthType: NONE
+
+  UrlInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref Function
+      Action: lambda:InvokeFunction
+      Principal: "*"
+      InvokedViaFunctionUrl: true
+
+  # CloudFront sits in front of the function URL for one reason: a function
+  # URL renames the WWW-Authenticate response header, which MCP clients read to
+  # find the login. The response function below sends the real header.
+  ForwardHostFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub ${AWS::StackName}-forward-host
+      AutoPublish: true
+      FunctionConfig:
+        Comment: Tells the origin which public hostname the client used
+        Runtime: cloudfront-js-2.0
+      FunctionCode: |
+        function handler(event) {
+          var request = event.request;
+          request.headers['x-forwarded-host'] = { value: request.headers.host.value };
+          return request;
+        }
+
+  RestoreAuthHeaderFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub ${AWS::StackName}-restore-auth-header
+      AutoPublish: true
+      FunctionConfig:
+        Comment: Turns the origin's marked response into a 401 with WWW-Authenticate
+        Runtime: cloudfront-js-2.0
+      # CloudFront only runs this for successful origin responses, so the
+      # handler sends its login challenge as a 200 with this marker header.
+      FunctionCode: |
+        function handler(event) {
+          var response = event.response;
+          var challenge = response.headers['x-mcp-challenge'];
+          if (challenge) {
+            response.statusCode = 401;
+            response.statusDescription = 'Unauthorized';
+            response.headers['www-authenticate'] = { value: challenge.value };
+            delete response.headers['x-mcp-challenge'];
+          }
+          return response;
+        }
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub ${AWS::StackName} MCP endpoint
+        HttpVersion: http2
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: function-url
+            DomainName: !Select [2, !Split ["/", !GetAtt FunctionUrl.FunctionUrl]]
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+            OriginCustomHeaders:
+              # The handler refuses requests that lack this header, so the
+              # function URL cannot be used directly.
+              - HeaderName: x-origin-verify
+                HeaderValue: !Select [2, !Split ["/", !Ref AWS::StackId]]
+        DefaultCacheBehavior:
+          TargetOriginId: function-url
+          ViewerProtocolPolicy: https-only
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+          Compress: false
+          # Managed policies: CachingDisabled and AllViewerExceptHostHeader.
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt ForwardHostFunction.FunctionMetadata.FunctionARN
+            - EventType: viewer-response
+              FunctionARN: !GetAtt RestoreAuthHeaderFunction.FunctionMetadata.FunctionARN
+
+Outputs:
+  McpUrl:
+    Description: URL to add to Claude as a custom connector, and to WorkOS as a resource indicator
+    Value: !Sub https://${Distribution.DomainName}/mcp
+  FunctionName:
+    Value: !Ref Function
