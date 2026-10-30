@@ -246,6 +246,21 @@ describe("Google account and tokens", () => {
     expect(text).not.toContain(GRANT.refreshToken);
   });
 
+  test("picks up a reconnected grant when the one in memory stops working", async () => {
+    const google = fakeGoogle({ validRefreshTokens: [GRANT.refreshToken] });
+    const store = memoryStore();
+    const gmail = new GmailClient({ store, allowedEmail: OWNER_EMAIL, fetch: google.fetch });
+    await gmail.listMessages("in:spam", 1);
+    // A week later: the old token is dead and connect-google has stored a new one.
+    google.calls.length = 0;
+    (gmail as any).expiresAt = 0;
+    google.validRefreshTokens = ["new-refresh-token"];
+    await store.save({ ...GRANT, refreshToken: "new-refresh-token" });
+    await gmail.listMessages("in:spam", 1);
+    const refreshes = google.calls.filter((c) => c.url.href.includes("oauth2")).map((c) => c.body.refresh_token);
+    expect(refreshes).toEqual([GRANT.refreshToken, "new-refresh-token"]);
+  });
+
   test("no connected account says how to connect", async () => {
     const { text } = await setup(fakeGoogle(), memoryStore(null)).callTool("search_spam");
     expect(text).toContain("No Google account is connected");

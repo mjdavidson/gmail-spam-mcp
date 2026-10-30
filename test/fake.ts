@@ -87,10 +87,11 @@ export interface Call {
   authorization?: string;
 }
 
-export function fakeGoogle(options: { messages?: GmailMessage[]; profileEmail?: string; tokenError?: string; listIds?: string[] } = {}) {
+export function fakeGoogle(options: { messages?: GmailMessage[]; profileEmail?: string; tokenError?: string; listIds?: string[]; validRefreshTokens?: string[] } = {}) {
   const messages = new Map((options.messages ?? sampleMessages()).map((m) => [m.id, structuredClone(m)]));
   const calls: Call[] = [];
   let tokens = 0;
+  const state = { validRefreshTokens: options.validRefreshTokens };
   const reply = (data: unknown, status = 200) => new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } });
 
   const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
@@ -102,6 +103,9 @@ export function fakeGoogle(options: { messages?: GmailMessage[]; profileEmail?: 
 
     if (url.href === "https://oauth2.googleapis.com/token") {
       if (options.tokenError) return reply({ error: options.tokenError }, 400);
+      if (state.validRefreshTokens && !state.validRefreshTokens.includes(body.refresh_token)) {
+        return reply({ error: "invalid_grant", error_description: "Token has been expired or revoked." }, 400);
+      }
       tokens++;
       return reply({ access_token: `access-${tokens}`, expires_in: 3599, scope: "https://www.googleapis.com/auth/gmail.modify", token_type: "Bearer" });
     }
@@ -138,5 +142,13 @@ export function fakeGoogle(options: { messages?: GmailMessage[]; profileEmail?: 
     return reply({ error: { message: `unexpected ${path}` } }, 500);
   }) as typeof fetch;
 
-  return { fetch: fetchImpl, calls, messages, tokenCount: () => tokens };
+  return {
+    fetch: fetchImpl,
+    calls,
+    messages,
+    tokenCount: () => tokens,
+    set validRefreshTokens(value: string[] | undefined) {
+      state.validRefreshTokens = value;
+    },
+  };
 }

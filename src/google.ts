@@ -102,7 +102,8 @@ export class GmailClient {
     return grant;
   }
 
-  private async refresh(): Promise<string> {
+  private async refresh(reloaded = false): Promise<string> {
+    const cached = this.grant !== null;
     const grant = await this.loadGrant();
     let res: Response;
     try {
@@ -123,8 +124,10 @@ export class GmailClient {
     const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
     if (!res.ok || typeof body.access_token !== "string") {
       if (body.error === "invalid_grant") {
-        // Forget the dead grant so a freshly connected one is read next time.
+        // Forget the dead grant. If it came from memory, the account may have
+        // been reconnected since, so read the stored one and try once more.
         this.grant = null;
+        if (cached && !reloaded) return this.refresh(true);
         throw new ReconnectError(
           "Google rejected the stored refresh token: it has expired or been revoked. " +
             "Apps in testing mode get refresh tokens that expire after 7 days.",
